@@ -1,0 +1,10 @@
+# 爬虫输出
+output/
+*.pyc
+__pycache__/
+_selftest_tmp/
+
+# 虚拟环境
+.venv/
+venv/
+env/
