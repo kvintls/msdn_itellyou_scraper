@@ -46,12 +46,14 @@ from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+_IMPORT_ERROR: Optional[BaseException] = None
 try:
     import requests
     from requests.adapters import HTTPAdapter
     from urllib3.util.retry import Retry
-except ImportError:  # pragma: no cover - only hit when deps missing
+except Exception as _exc:  # noqa: BLE001 - capture the REAL reason, don't hide it
     requests = None  # type: ignore
+    _IMPORT_ERROR = _exc
 
 ROOT_URL = "https://msdn.itellyou.cn"
 
@@ -115,7 +117,12 @@ class MsdnScraper:
                  fetch_detail: bool = True, timeout: int = 30):
         if requests is None:
             raise RuntimeError(
-                "缺少依赖 'requests'。请先运行: pip install -r requirements.txt"
+                "导入 requests / urllib3 相关依赖失败。\n"
+                f"真实错误: {type(_IMPORT_ERROR).__name__}: {_IMPORT_ERROR}\n"
+                "若 requests 已安装仍报此错，通常是 urllib3 版本不兼容 "
+                "(requests 2.31 需要 urllib3<2)。请尝试:\n"
+                '    pip install "urllib3<2" "requests>=2.31,<3"\n'
+                "或直接: pip install -r requirements.txt --upgrade"
             )
         self.workers = workers
         self.delay = delay
