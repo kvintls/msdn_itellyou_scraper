@@ -186,6 +186,7 @@ class MsdnScraper:
             sys.stderr.write(f"[debug] -> POST {path} {payload}\n")
             sys.stderr.flush()
         t0 = time.time()
+        r = None
         try:
             r = self.session.post(url, data=payload, timeout=self.timeout)
             r.raise_for_status()
@@ -197,7 +198,12 @@ class MsdnScraper:
             return data
         except Exception as exc:  # noqa: BLE001
             dt = time.time() - t0
-            sys.stderr.write(f"[warn] POST {path} {payload} 失败 ({dt:.1f}s): {exc}\n")
+            extra = ""
+            if r is not None:
+                # 显示真实的 HTTP 状态和原始响应片段，便于判断是空响应/HTML/被限流。
+                body = (r.text or "").strip().replace("\n", " ")
+                extra = f" [HTTP {r.status_code}, len={len(r.text or '')}, body={body[:160]!r}]"
+            sys.stderr.write(f"[warn] POST {path} {payload} 失败 ({dt:.1f}s): {exc}{extra}\n")
             return None
 
     # ---- 各接口 ------------------------------------------------------------ #
@@ -334,6 +340,9 @@ def build_record_from_list_item(item: dict, category: str, subcategory: str,
         language=language,
         name=_pick(item, "name", "Name"),
         download=_pick(item, "download", "url", "DownLoad", "Download"),
+        sha1=_pick(item, "sha1", "SHA1"),
+        size=_pick(item, "size", "Size"),
+        file_name=_pick(item, "filename", "FileName"),
         updated=updated,
         product_id=_pick(item, "id", "Id", "ID"),
     )
