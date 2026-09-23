@@ -7,26 +7,28 @@ msdn.itellyou.cn 数据爬虫 / scraper.
 包括分类、语言、文件名、发布时间、ed2k 下载地址、SHA1、文件大小，
 并导出为 CSV 和 JSON。
 
-站点是一个 SPA，数据通过下面的 REST 接口按层级返回：
+站点是一个 SPA，数据通过下面的 REST 接口按层级返回。改版后：
+  * 接口前缀是 /Index/（旧版是 /Category/，现已 404）；
+  * 每个 POST 都需要 CSRF token：先 GET 首页，从 HTML 里取 data-token，
+    再作为 X-CSRF-TOKEN 请求头发送（同时带上首页返回的 Cookie）；
+  * 详情字段名是小写（filename / download / sha1 / size）。
 
-    GET  /                       -> 首页 HTML，含 data-menuid（8 个顶级大类 id）
-    POST /Category/Index  {id}   -> 该大类下的小分类（产品）列表
-    POST /Category/GetLang {id}  -> {status, result:[{id, lang}, ...]}   语言列表
-    POST /Category/GetList {id, lang, filter}
-                                 -> {status, result:[{id, name, url, post, ...}]} 文件列表
-    POST /Category/GetProduct {id}
-                                 -> {status, result:{FileName, DownLoad, PostDateString, SHA1, size, ...}}
-
-所有 POST 请求都需要 Referer 头，否则会被拒绝。
+    GET  /                          -> 首页 HTML，含 data-token=<csrf>
+    POST /Index/GetCategory {id}    -> 某顶级大类下的分类(产品)列表: [{id, name}, ...]
+    POST /Index/GetLang     {id}    -> {result:[{id, lang}, ...]}   语言列表
+    POST /Index/GetList {id, lang, filter}
+                                    -> {result:[{id, name, ...}, ...]} 文件列表
+    POST /Index/GetProduct  {id}    -> {result:{filename, download, sha1, size, ...}}
 
 用法:
-    pip install -r requirements.txt
+    python -m pip install -r requirements.txt
     python msdn_scraper.py                    # 抓取全部，输出到 ./output/
     python msdn_scraper.py --workers 16       # 提高并发（默认 8）
     python msdn_scraper.py --delay 0.1        # 每个详情请求之间的间隔（秒）
     python msdn_scraper.py --out mydir        # 自定义输出目录
     python msdn_scraper.py --no-detail        # 跳过 GetProduct（更快，但无 SHA1/大小）
     python msdn_scraper.py --selftest         # 用内置的假数据离线自测解析逻辑
+    python msdn_scraper.py --debug            # 打印每个请求的原始响应片段，便于排查接口变更
 
 注意: 运行环境必须能访问外网 (msdn.itellyou.cn)。
 """
@@ -42,9 +44,9 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 _IMPORT_ERROR: Optional[BaseException] = None
 try:
@@ -57,16 +59,22 @@ except Exception as _exc:  # noqa: BLE001 - capture the REAL reason, don't hide 
 
 ROOT_URL = "https://msdn.itellyou.cn"
 
-# 首页解析失败时使用的稳定顶级大类 id（来自站点，长期未变）。
-FALLBACK_TOP_CATEGORIES = [
-    "7ab5f0cb-7607-4bbe-9e88-50716dc43de6",  # 操作系统
-    "36d3766e-0efb-491e-961b-d1a419e06c68",  # 服务器
-    "051d75ee-ff53-43fe-80e9-bac5c10fc0fb",  # 应用程序
-    "fcf12b78-0662-4dd4-9a82-72040db91c9e",  # 开发人员工具
-    "5d6967f0-b58d-4385-8769-b886bfc2b78c",  # 设计人员工具
-    "aff8a80f-2dee-4bba-80ec-611ac56d3849",  # 企业解决方案
-    "23958de6-bedb-4998-825c-aa3d1e00d097",  # MSDN 技术资源库
-    "95c4acfd-d1a6-41fe-b14d-a6816973d2aa",  # 工具和资源
+# 改版后的接口（/Index/ 前缀）。
+EP_CATEGORY = "/Index/GetCategory"
+EP_LANG = "/Index/GetLang"
+EP_LIST = "/Index/GetList"
+EP_PRODUCT = "/Index/GetProduct"
+
+# 8 个顶级大类（id 长期稳定）。GetCategory 以这些 id 为入口，返回其下的分类列表。
+TOP_CATEGORIES: List[Tuple[str, str]] = [
+    ("7ab5f0cb-7607-4bbe-9e88-50716dc43de6", "操作系统"),
+    ("36d3766e-0efb-491e-961b-d1a419e06c68", "服务器"),
+    ("051d75ee-ff53-43fe-80e9-bac5c10fc0fb", "应用程序"),
+    ("fcf12b78-0662-4dd4-9a82-72040db91c9e", "开发人员工具"),
+    ("5d6967f0-b58d-4385-8769-b886bfc2b78c", "设计人员工具"),
+    ("aff8a80f-2dee-4bba-80ec-611ac56d3849", "企业解决方案"),
+    ("23958de6-bedb-4998-825c-aa3d1e00d097", "MSDN 技术资源库"),
+    ("95c4acfd-d1a6-41fe-b14d-a6816973d2aa", "工具和资源"),
 ]
 
 HEADERS = {
@@ -78,7 +86,8 @@ HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
 }
 
-MENUID_RE = re.compile(r'data-menuid="([0-9a-fA-F-]{36})"')
+# 首页里的 CSRF token，形如 data-token=xxxx 或 data-token="xxxx"。
+TOKEN_RE = re.compile(r'data-token=["\']?([\w-]+)')
 
 
 # --------------------------------------------------------------------------- #
@@ -98,7 +107,6 @@ class Record:
     file_name: str = ""       # 文件名
     product_id: str = ""      # GetProduct 的 id
 
-    # CSV 列顺序（中文表头，与社区备份格式兼容）。
     CSV_HEADER = ["大分类", "小分类", "语言", "名字", "更新时间", "下载地址", "SHA1", "大小", "文件名", "产品ID"]
 
     def as_row(self) -> List[str]:
@@ -114,23 +122,25 @@ class Record:
 # --------------------------------------------------------------------------- #
 class MsdnScraper:
     def __init__(self, workers: int = 8, delay: float = 0.05,
-                 fetch_detail: bool = True, timeout: int = 30):
+                 fetch_detail: bool = True, timeout: int = 30, debug: bool = False):
         if requests is None:
             raise RuntimeError(
                 "导入 requests / urllib3 相关依赖失败。\n"
                 f"真实错误: {type(_IMPORT_ERROR).__name__}: {_IMPORT_ERROR}\n"
-                "若 requests 已安装仍报此错，通常是 urllib3 版本不兼容 "
-                "(requests 2.31 需要 urllib3<2)。请尝试:\n"
-                '    pip install "urllib3<2" "requests>=2.31,<3"\n'
-                "或直接: pip install -r requirements.txt --upgrade"
+                "请用运行脚本的同一个解释器安装依赖:\n"
+                "    python -m pip install -r requirements.txt\n"
+                "若 requests 已装仍报错，通常是版本不兼容，可尝试:\n"
+                '    python -m pip install "urllib3<2" "charset-normalizer<3.4" "requests>=2.28"'
             )
         self.workers = workers
         self.delay = delay
         self.fetch_detail = fetch_detail
         self.timeout = timeout
+        self.debug = debug
         self.session = self._build_session()
         self._lock = threading.Lock()
         self._done = 0
+        self._init_token()
 
     @staticmethod
     def _build_session() -> "requests.Session":
@@ -146,88 +156,88 @@ class MsdnScraper:
         s.mount("https://", adapter)
         return s
 
+    def _init_token(self) -> None:
+        """GET 首页拿 Cookie，并从 HTML 里解析 CSRF token 写入请求头。"""
+        try:
+            r = self.session.get(ROOT_URL + "/", timeout=self.timeout)
+            r.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"访问首页失败: {exc}\n请确认本机能打开 https://msdn.itellyou.cn/ 。"
+            ) from exc
+        m = TOKEN_RE.search(r.text)
+        if not m:
+            raise RuntimeError(
+                "未能从首页解析出 CSRF token (data-token)。\n"
+                "站点结构可能又变了。请用 --debug 运行，或在浏览器 F12 → Network 里\n"
+                "查看首页 HTML 中的 token 字段名，然后把它发给我以便更新脚本。"
+            )
+        token = m.group(1)
+        self.session.headers["X-CSRF-TOKEN"] = token
+        if self.debug:
+            sys.stderr.write(f"[debug] CSRF token = {token}\n")
+
     # ---- 低层请求 ---------------------------------------------------------- #
-    def _post_json(self, path: str, payload: Dict[str, Any]) -> Optional[dict]:
+    def _post_json(self, path: str, payload: Dict[str, Any]) -> Optional[Any]:
         url = ROOT_URL + path
         try:
             r = self.session.post(url, data=payload, timeout=self.timeout)
             r.raise_for_status()
-            return r.json()
+            data = r.json()
+            if self.debug:
+                snippet = json.dumps(data, ensure_ascii=False)[:300]
+                sys.stderr.write(f"[debug] POST {path} {payload} -> {snippet}\n")
+            return data
         except Exception as exc:  # noqa: BLE001
             sys.stderr.write(f"[warn] POST {path} {payload} 失败: {exc}\n")
             return None
 
     # ---- 各接口 ------------------------------------------------------------ #
-    def get_top_categories(self) -> List[str]:
-        """从首页解析 8 个顶级大类 id，失败则用回退列表。"""
-        try:
-            r = self.session.get(ROOT_URL + "/", timeout=self.timeout)
-            r.raise_for_status()
-            ids = list(dict.fromkeys(MENUID_RE.findall(r.text)))
-            if ids:
-                return ids
-            sys.stderr.write("[warn] 首页未解析到 data-menuid，使用回退大类列表。\n")
-        except Exception as exc:  # noqa: BLE001
-            sys.stderr.write(f"[warn] 获取首页失败 ({exc})，使用回退大类列表。\n")
-        return list(FALLBACK_TOP_CATEGORIES)
+    def get_categories(self, base_id: str) -> List[dict]:
+        """POST /Index/GetCategory -> 该顶级大类下的分类列表 [{id, name}, ...]。"""
+        return parse_category_list(self._post_json(EP_CATEGORY, {"id": base_id}))
 
-    def get_index(self, cat_id: str) -> List[dict]:
-        """POST /Category/Index -> 小分类列表。返回 [{id, name}, ...]。"""
-        data = self._post_json("/Category/Index", {"id": cat_id})
-        return parse_index(data)
+    def get_langs(self, cat_id: str) -> List[dict]:
+        """POST /Index/GetLang -> [{id, lang}, ...]。"""
+        return parse_result_list(self._post_json(EP_LANG, {"id": cat_id}))
 
-    def get_langs(self, sub_id: str) -> List[dict]:
-        """POST /Category/GetLang -> [{id, lang}, ...]。"""
-        data = self._post_json("/Category/GetLang", {"id": sub_id})
-        return parse_result_list(data)
-
-    def get_list(self, sub_id: str, lang_id: str) -> List[dict]:
-        """POST /Category/GetList -> 文件列表 [{id, name, url, post, ...}]。"""
-        data = self._post_json(
-            "/Category/GetList",
-            {"id": sub_id, "lang": lang_id, "filter": "true"},
-        )
+    def get_list(self, cat_id: str, lang_id: str) -> List[dict]:
+        """POST /Index/GetList -> 文件列表 [{id, name, ...}]。"""
+        data = self._post_json(EP_LIST, {"id": cat_id, "lang": lang_id, "filter": "true"})
         return parse_result_list(data)
 
     def get_product(self, product_id: str) -> Optional[dict]:
-        """POST /Category/GetProduct -> 详情 dict。"""
-        data = self._post_json("/Category/GetProduct", {"id": product_id})
-        if isinstance(data, dict) and data.get("status") and isinstance(data.get("result"), dict):
+        """POST /Index/GetProduct -> 详情 dict。"""
+        data = self._post_json(EP_PRODUCT, {"id": product_id})
+        if isinstance(data, dict) and isinstance(data.get("result"), dict):
             return data["result"]
         return None
 
     # ---- 编排 -------------------------------------------------------------- #
     def scrape(self) -> List[Record]:
-        top_ids = self.get_top_categories()
-        sys.stderr.write(f"[info] 顶级大类 {len(top_ids)} 个。\n")
-
-        # 先把层级走到「文件列表」这一层，收集所有条目。
+        sys.stderr.write(f"[info] 顶级大类 {len(TOP_CATEGORIES)} 个。\n")
         pending: List[Record] = []
-        for cat_id in top_ids:
-            subs = self.get_index(cat_id)
-            cat_name = _first_nonempty(_names_from(subs)) or cat_id
-            for sub in subs:
-                sub_id = sub.get("id", "")
-                sub_name = sub.get("name", "")
+        for base_id, base_name in TOP_CATEGORIES:
+            cats = self.get_categories(base_id)
+            for cat in cats:
+                sub_id = str(cat.get("id", ""))
+                sub_name = str(cat.get("name", ""))
                 if not sub_id:
                     continue
-                langs = self.get_langs(sub_id)
-                for lang in langs:
-                    lang_id = lang.get("id", "")
-                    lang_name = lang.get("lang", "") or lang.get("name", "")
+                for lang in self.get_langs(sub_id):
+                    lang_id = str(lang.get("id", ""))
+                    lang_name = str(lang.get("lang", "") or lang.get("name", ""))
                     if not lang_id:
                         continue
-                    files = self.get_list(sub_id, lang_id)
-                    for f in files:
+                    for f in self.get_list(sub_id, lang_id):
                         pending.append(
                             build_record_from_list_item(
-                                f, category=cat_name, subcategory=sub_name,
+                                f, category=base_name, subcategory=sub_name,
                                 language=lang_name,
                             )
                         )
-            sys.stderr.write(f"[info] 大类 {cat_name!r} 完成，累计条目 {len(pending)}。\n")
+            sys.stderr.write(f"[info] 大类 {base_name!r} 完成，累计条目 {len(pending)}。\n")
 
-        # 需要详情则并发抓取 GetProduct 补全 SHA1/大小/下载地址。
         if self.fetch_detail and pending:
             self._enrich_details(pending)
         return pending
@@ -256,20 +266,21 @@ class MsdnScraper:
 # --------------------------------------------------------------------------- #
 # 纯解析函数（可离线单测，不依赖网络）
 # --------------------------------------------------------------------------- #
-def parse_index(data: Any) -> List[dict]:
-    """/Category/Index 的返回可能是 list，或 {status,result:[...]}。统一成 list。"""
+def parse_category_list(data: Any) -> List[dict]:
+    """GetCategory 可能返回裸 list，或 {result:[...]}。统一成 list。"""
     if isinstance(data, list):
         return [x for x in data if isinstance(x, dict)]
-    if isinstance(data, dict):
-        if isinstance(data.get("result"), list):
-            return [x for x in data["result"] if isinstance(x, dict)]
+    if isinstance(data, dict) and isinstance(data.get("result"), list):
+        return [x for x in data["result"] if isinstance(x, dict)]
     return []
 
 
 def parse_result_list(data: Any) -> List[dict]:
-    """解析 {status:true, result:[...]} 结构。"""
-    if isinstance(data, dict) and data.get("status") and isinstance(data.get("result"), list):
+    """解析 {result:[...]} 结构（新版可能没有 status 字段，故不强制要求）。"""
+    if isinstance(data, dict) and isinstance(data.get("result"), list):
         return [x for x in data["result"] if isinstance(x, dict)]
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
     return []
 
 
@@ -287,42 +298,46 @@ def _epoch_to_date(post: Any) -> str:
         return ""
 
 
+def _pick(d: dict, *keys: str) -> str:
+    """按顺序取第一个非空字段（大小写字段名兼容）。"""
+    for k in keys:
+        v = d.get(k)
+        if v:
+            return str(v)
+    return ""
+
+
 def build_record_from_list_item(item: dict, category: str, subcategory: str,
                                  language: str) -> Record:
+    updated = _pick(item, "PostDateString", "updatetime", "time")
+    if not updated:
+        updated = _epoch_to_date(item.get("post") or item.get("PostDate"))
     return Record(
         category=category,
         subcategory=subcategory,
         language=language,
-        name=str(item.get("name", "")),
-        download=str(item.get("url", "") or ""),
-        updated=_epoch_to_date(item.get("post")),
-        product_id=str(item.get("id", "")),
+        name=_pick(item, "name", "Name"),
+        download=_pick(item, "download", "url", "DownLoad", "Download"),
+        updated=updated,
+        product_id=_pick(item, "id", "Id", "ID"),
     )
 
 
 def apply_product_detail(rec: Record, detail: dict) -> None:
-    """用 GetProduct 的详情补全一条记录。"""
-    dl = detail.get("DownLoad") or detail.get("Download") or rec.download
-    rec.download = str(dl or "")
-    rec.sha1 = str(detail.get("SHA1", "") or "")
-    rec.size = str(detail.get("size", "") or detail.get("Size", "") or "")
-    rec.file_name = str(detail.get("FileName", "") or "")
-    date = detail.get("PostDateString") or _epoch_to_date(detail.get("PostDate"))
+    """用 GetProduct 的详情补全一条记录（新版字段为小写）。"""
+    dl = _pick(detail, "download", "DownLoad", "Download")
+    if dl:
+        rec.download = dl
+    rec.sha1 = _pick(detail, "sha1", "SHA1") or rec.sha1
+    rec.size = _pick(detail, "size", "Size") or rec.size
+    rec.file_name = _pick(detail, "filename", "FileName") or rec.file_name
+    date = _pick(detail, "PostDateString", "updatetime", "time")
+    if not date:
+        date = _epoch_to_date(detail.get("post") or detail.get("PostDate"))
     if date:
-        rec.updated = str(date)
+        rec.updated = date
     if not rec.name:
-        rec.name = str(detail.get("Name", "") or "")
-
-
-def _names_from(subs: List[dict]) -> List[str]:
-    return [s.get("category", "") or s.get("cat", "") for s in subs]
-
-
-def _first_nonempty(items: List[str]) -> str:
-    for it in items:
-        if it:
-            return it
-    return ""
+        rec.name = _pick(detail, "name", "Name")
 
 
 # --------------------------------------------------------------------------- #
@@ -347,52 +362,50 @@ def write_json(records: List[Record], path: str) -> None:
 def _selftest() -> int:
     print("running offline self-test…")
 
-    # parse_result_list
-    lang_payload = {"status": True, "result": [
-        {"id": "lang-1", "lang": "中文 - 简体"},
-        {"id": "lang-2", "lang": "英语"},
-    ]}
-    langs = parse_result_list(lang_payload)
-    assert langs == lang_payload["result"], langs
-    assert parse_result_list({"status": False, "result": []}) == []
+    # CSRF token 正则：兼容带引号/不带引号。
+    assert TOKEN_RE.search('foo data-token=abc-123_XY bar').group(1) == "abc-123_XY"
+    assert TOKEN_RE.search('<div data-token="tok-9">').group(1) == "tok-9"
+
+    # GetCategory: 裸 list 与 {result:[...]} 两种形态。
+    assert parse_category_list([{"id": "a", "name": "Windows 10"}]) == [{"id": "a", "name": "Windows 10"}]
+    assert parse_category_list({"result": [{"id": "b"}]}) == [{"id": "b"}]
+    assert parse_category_list({}) == []
+
+    # GetLang / GetList: 有无 status 都要能解析。
+    assert parse_result_list({"result": [{"id": "l1", "lang": "中文 - 简体"}]}) == [{"id": "l1", "lang": "中文 - 简体"}]
+    assert parse_result_list({"status": True, "result": [{"id": "x"}]}) == [{"id": "x"}]
     assert parse_result_list(None) == []
 
-    # parse_index (both shapes)
-    assert parse_index([{"id": "a", "name": "Windows 10"}]) == [{"id": "a", "name": "Windows 10"}]
-    assert parse_index({"result": [{"id": "b"}]}) == [{"id": "b"}]
-    assert parse_index({}) == []
-
-    # date parsing
+    # 时间戳解析
     assert _epoch_to_date("/Date(952214400000)/") == "2000-03-05"
     assert _epoch_to_date(952214400000) == "2000-03-05"
     assert _epoch_to_date(None) == ""
-    assert _epoch_to_date("garbage") == ""
 
-    # build + enrich
-    item = {
-        "id": "prod-1",
-        "name": "Windows 10 (multi-edition), Version 22H2 (x64) - DVD (Chinese-Simplified)",
-        "url": "ed2k://|file|zh-cn_win10.iso|6000000000|ABCDEF|/",
-        "post": "/Date(1664582400000)/",
-    }
+    # 列表项 -> 记录
+    item = {"id": "prod-1", "name": "Windows 10 22H2 (x64) (Chinese-Simplified)"}
     rec = build_record_from_list_item(item, "操作系统", "Windows 10", "中文 - 简体")
     assert rec.product_id == "prod-1"
-    assert rec.updated == "2022-10-01", rec.updated
-    assert rec.download.startswith("ed2k://")
+    assert rec.category == "操作系统" and rec.subcategory == "Windows 10"
 
+    # 详情补全（新版小写字段）
     detail = {
-        "FileName": "zh-cn_win10.iso",
-        "DownLoad": "ed2k://|file|zh-cn_win10.iso|6000000000|ABCDEF|/",
-        "SHA1": "1234567890ABCDEF1234567890ABCDEF12345678",
+        "filename": "zh-cn_win10.iso",
+        "download": "ed2k://|file|zh-cn_win10.iso|6000000000|ABCDEF|/",
+        "sha1": "1234567890ABCDEF1234567890ABCDEF12345678",
         "size": "5.59GB",
-        "PostDateString": "2022-10-01",
     }
     apply_product_detail(rec, detail)
-    assert rec.sha1 == "1234567890ABCDEF1234567890ABCDEF12345678"
+    assert rec.sha1 == detail["sha1"]
     assert rec.size == "5.59GB"
     assert rec.file_name == "zh-cn_win10.iso"
+    assert rec.download.startswith("ed2k://")
 
-    # output round-trip
+    # 详情补全（旧版大写字段也要兼容）
+    rec2 = build_record_from_list_item({"id": "p2", "name": "X"}, "服务器", "SBS", "英语")
+    apply_product_detail(rec2, {"FileName": "x.iso", "DownLoad": "ed2k://x", "SHA1": "AABB", "size": "1GB"})
+    assert rec2.file_name == "x.iso" and rec2.sha1 == "AABB"
+
+    # 输出 round-trip
     tmp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_selftest_tmp")
     os.makedirs(tmp_dir, exist_ok=True)
     csv_path = os.path.join(tmp_dir, "t.csv")
@@ -402,11 +415,10 @@ def _selftest() -> int:
     with open(csv_path, encoding="utf-8-sig") as fh:
         rows = list(csv.reader(fh))
     assert rows[0] == Record.CSV_HEADER
-    assert rows[1][0] == "操作系统" and rows[1][6] == detail["SHA1"]
+    assert rows[1][0] == "操作系统" and rows[1][6] == detail["sha1"]
     with open(json_path, encoding="utf-8") as fh:
         loaded = json.load(fh)
-    assert loaded[0]["sha1"] == detail["SHA1"]
-    # cleanup
+    assert loaded[0]["sha1"] == detail["sha1"]
     os.remove(csv_path)
     os.remove(json_path)
     os.rmdir(tmp_dir)
@@ -427,6 +439,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--no-detail", action="store_true",
                         help="跳过 GetProduct，不抓 SHA1/大小 (更快)")
     parser.add_argument("--timeout", type=int, default=30, help="请求超时秒数")
+    parser.add_argument("--debug", action="store_true", help="打印每个请求的原始响应片段")
     parser.add_argument("--selftest", action="store_true",
                         help="离线自测解析逻辑后退出，不联网")
     args = parser.parse_args(argv)
@@ -436,7 +449,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     scraper = MsdnScraper(
         workers=args.workers, delay=args.delay,
-        fetch_detail=not args.no_detail, timeout=args.timeout,
+        fetch_detail=not args.no_detail, timeout=args.timeout, debug=args.debug,
     )
     started = time.time()
     records = scraper.scrape()
@@ -444,7 +457,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not records:
         sys.stderr.write(
-            "[error] 未抓到任何数据。请确认运行环境能访问 https://msdn.itellyou.cn/ 。\n"
+            "[error] 未抓到任何数据。用 --debug 重跑查看接口返回，"
+            "若接口又变了请把 --debug 输出发我。\n"
         )
         return 1
 

@@ -64,21 +64,27 @@ JSON 为对象数组，字段：`category, subcategory, language, name, updated,
 
 ---
 
-## 工作原理
+## 工作原理（对应改版后的当前接口）
 
-站点是单页应用（SPA），数据通过下面的 REST 接口按层级返回。所有 `POST`
-请求都必须带 `Referer: https://msdn.itellyou.cn/` 头，否则被拒。
+站点是单页应用（SPA），数据通过下面的 REST 接口按层级返回。**改版后**接口前缀
+由 `/Category/` 改为 `/Index/`，并且每个 `POST` 都需要 **CSRF token**（先 GET 首页
+从 HTML 里取 `data-token`，作为 `X-CSRF-TOKEN` 头发送）；同时必须带
+`Referer: https://msdn.itellyou.cn/` 头和首页返回的 Cookie。
 
 | 步骤 | 请求 | 说明 |
 |------|------|------|
-| 1 | `GET  /` | 从 HTML 中用 `data-menuid="..."` 解析 8 个顶级大类 id（解析失败时使用内置的稳定回退 id 列表） |
-| 2 | `POST /Category/Index`  `{id}` | 某大类下的小分类（产品）列表 |
-| 3 | `POST /Category/GetLang` `{id}` | `{status, result:[{id, lang}]}` 语言列表 |
-| 4 | `POST /Category/GetList` `{id, lang, filter}` | `{status, result:[{id, name, url, post}]}` 文件列表 |
-| 5 | `POST /Category/GetProduct` `{id}` | `{status, result:{FileName, DownLoad, SHA1, size, PostDateString}}` 详情 |
+| 1 | `GET  /` | 拿 Cookie，并从 HTML 里解析 `data-token`（CSRF token）。8 个顶级大类 id 内置（长期稳定） |
+| 2 | `POST /Index/GetCategory` `{id}` | 某顶级大类下的分类（产品）列表 `[{id, name}, ...]` |
+| 3 | `POST /Index/GetLang` `{id}` | `{result:[{id, lang}]}` 语言列表 |
+| 4 | `POST /Index/GetList` `{id, lang, filter}` | `{result:[{id, name, ...}]}` 文件列表 |
+| 5 | `POST /Index/GetProduct` `{id}` | `{result:{filename, download, sha1, size}}` 详情（字段为小写） |
 
-爬虫特性：会话复用 + 自动重试/退避（429/5xx）、详情请求线程池并发、
-可调节的请求间隔（礼貌抓取）、进度输出、CSV + JSON 双输出。
+爬虫特性：自动获取 CSRF token、会话/Cookie 复用、自动重试/退避（429/5xx）、
+详情请求线程池并发、可调节的请求间隔（礼貌抓取）、进度输出、CSV + JSON 双输出、
+字段名大小写兼容、`--debug` 打印原始响应便于排查接口再次变更。
+
+> 站点接口随时可能再次调整。若某天所有请求都失败或抓不到数据，用 `python msdn_scraper.py --debug`
+> 运行，把输出发来即可据此更新解析逻辑。
 
 ## 合规提示
 
