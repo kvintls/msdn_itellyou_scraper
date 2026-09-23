@@ -182,16 +182,22 @@ class MsdnScraper:
     # ---- 低层请求 ---------------------------------------------------------- #
     def _post_json(self, path: str, payload: Dict[str, Any]) -> Optional[Any]:
         url = ROOT_URL + path
+        if self.debug:
+            sys.stderr.write(f"[debug] -> POST {path} {payload}\n")
+            sys.stderr.flush()
+        t0 = time.time()
         try:
             r = self.session.post(url, data=payload, timeout=self.timeout)
             r.raise_for_status()
             data = r.json()
             if self.debug:
+                dt = time.time() - t0
                 snippet = json.dumps(data, ensure_ascii=False)[:300]
-                sys.stderr.write(f"[debug] POST {path} {payload} -> {snippet}\n")
+                sys.stderr.write(f"[debug]    <- {r.status_code} ({dt:.1f}s) {snippet}\n")
             return data
         except Exception as exc:  # noqa: BLE001
-            sys.stderr.write(f"[warn] POST {path} {payload} 失败: {exc}\n")
+            dt = time.time() - t0
+            sys.stderr.write(f"[warn] POST {path} {payload} 失败 ({dt:.1f}s): {exc}\n")
             return None
 
     # ---- 各接口 ------------------------------------------------------------ #
@@ -221,11 +227,14 @@ class MsdnScraper:
         pending: List[Record] = []
         for base_id, base_name in TOP_CATEGORIES:
             cats = self.get_categories(base_id)
-            for cat in cats:
+            sys.stderr.write(f"[info] 大类 {base_name!r}: {len(cats)} 个子分类。\n")
+            sys.stderr.flush()
+            for idx, cat in enumerate(cats, 1):
                 sub_id = str(cat.get("id", ""))
                 sub_name = str(cat.get("name", ""))
                 if not sub_id:
                     continue
+                before = len(pending)
                 for lang in self.get_langs(sub_id):
                     lang_id = str(lang.get("id", ""))
                     lang_name = str(lang.get("lang", "") or lang.get("name", ""))
@@ -238,6 +247,11 @@ class MsdnScraper:
                                 language=lang_name,
                             )
                         )
+                sys.stderr.write(
+                    f"[info]   [{base_name} {idx}/{len(cats)}] {sub_name} "
+                    f"(+{len(pending) - before} 条，累计 {len(pending)})\n"
+                )
+                sys.stderr.flush()
             sys.stderr.write(f"[info] 大类 {base_name!r} 完成，累计条目 {len(pending)}。\n")
 
         if self.fetch_detail and pending:
