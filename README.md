@@ -23,9 +23,16 @@
 
 ## 安装
 
+**务必用 `python -m pip`** —— 这样能保证把依赖装进 `python` 这个解释器
+(而不是另一个同名但不同路径的 Python，否则会出现「pip 说装好了、python 却找不到」的问题)：
+
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
+
+> 如果 `python` 命令不存在，把上面和下面所有命令里的 `python` 换成 `python3`。
+> 想确认有没有装串：`where python`（Windows）/ `which python`（Mac/Linux），
+> 对比它和 `pip` 的路径是否一致。
 
 ## 使用
 
